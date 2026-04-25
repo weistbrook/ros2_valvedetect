@@ -1,227 +1,297 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import cv2
+import torch
+import yaml
+from ultralytics import YOLO
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from rclpy.action import ActionServer
-from ultralytics import YOLO
 from cv_bridge import CvBridge
-import cv2
-import torch
-import yaml 
-from interfaces import valvecoord
-class ValveDetectionNode(Node):
-    def __init__(self, name):
-        super().__init__(name)
-        ENGINE_MODEL_PATH = "/home/jetson/ultralytics_robot/best.engine"
-        self.model = YOLO(ENGINE_MODEL_PATH, task="detect")
-        self.bridge = CvBridge()
-        self.depth_image = None
-        self.camera_info = None
-        self.img_size = 640  
-        self.names = self.model.names  # 获取类别名称列表
-        self.valve_pub = self.create_publisher(
-            valvecoord,
-            '/valve/position',
-            10
-        )
-        
-        self.get_logger().info('Valve Detection Node has been started.')
 
-        self.rgb_subscription = self.create_subscription(
-            Image,
-            "/camera/color/image_raw",
-            self.image_callback,
-            1  # 队列大小1：只保留最新帧
-            )  
-        
-        self.depth_subscription = self.create_subscription(
-            Image,
-            "/camera/depth/image_raw",
-            self.depth_callback,
-            queue_size=1) 
+# 建议把 msg 文件命名为 ValveCommand.msg，然后这样导入
+from interfaces.msg import ValveCommand
+
+# 如果 judge_proper 在 utility.py 里，就改成：from utility import judge_proper
+#from utility import judge_proper
+import dev_angle
+
+class ValveDetectionNode(Node):
+    """
+    只负责：
+    1. 接收 RGB + Depth
+    2. YOLO 检测
+    3. 计算 3D 坐标
+    4. 判断运动类型和旋转校正
+    5. 发布 ValveCommand
+
+    不在这里直接控制机械臂。
+    """
+
+    def __init__(self):
+        super().__init__('valve_detection_node')
+
+        self.declare_parameter('model_path', '/home/jetson/ultralytics_robot/best.engine')
+        self.declare_parameter('camera_info_yaml', '/home/jetson/ultralytics_robot/src/robot_valve_control/robot_valve_control/camera_info.yaml')
+        self.declare_parameter('rgb_topic', '/camera/color/image_raw')
+        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
+        self.declare_parameter('command_topic', '/valve/command')
+        self.declare_parameter('show_image', True)
+
+        model_path = self.get_parameter('model_path').value
+        camera_info_yaml = self.get_parameter('camera_info_yaml').value
+        rgb_topic = self.get_parameter('rgb_topic').value
+        depth_topic = self.get_parameter('depth_topic').value
+        command_topic = self.get_parameter('command_topic').value
+
+        self.model = YOLO(model_path, task='detect')
+        self.names = self.model.names
+        self.img_size = 640
+        self.bridge = CvBridge()
+
+        self.depth_image = None
+        self.camera_info = self.load_camera_info(camera_info_yaml)
+
+        self.command_pub = self.create_publisher(ValveCommand, command_topic, 10)
+
+        self.create_subscription(Image, rgb_topic, self.image_callback, 1)
+        self.create_subscription(Image, depth_topic, self.depth_callback, 1)
+
+        self.get_logger().info('ValveDetectionNode started. Publishing command only; robot motion is separated.')
 
     def depth_callback(self, msg):
         try:
-        # 将ROS消息转换为OpenCV格式（passthrough保持原始编码，通常为16位深度值，单位毫米）
-            depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         except Exception as e:
-            # 每5秒最多打印一次警告（避免日志刷屏）
-            self.get_logger().logwarn_throttle(5, f"深度图解析失败: {e}")
-        self.depth_image = depth_image
+            self.get_logger().warn(f'深度图解析失败: {e}')
 
     def image_callback(self, msg):
         if self.depth_image is None or self.camera_info is None:
-            self.get_logger().logwarn_throttle(5, "等待深度图和相机内参加载完成...")
+            self.get_logger().warn('等待深度图和相机内参...')
             return
-        
-        try: 
-            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")  # 转换为BGR格式
-            results = self.model(
-            frame,           # 直接用原始 BGR 图像
-            imgsz=self.img_size,
-            conf=0.65,
-            iou=0.45,
-            verbose=False,
-            )
-        # 将 Ultralytics 输出转换为和原来一样结构的 dets（列表，每个元素是 [x1,y1,x2,y2,conf,cls] 的 tensor）
-            if not results:
-                # 没有结果时，构造一个空 det，后面的 for det in dets 逻辑保持一致
-                dets = [torch.empty((0, 6))]
-            else:  
-                res = results[0]
-                boxes = res.boxes  # Boxes 对象
 
-                if boxes is None or len(boxes) == 0:
-                    dets = [torch.empty((0, 6))]
-                else:
-                    # 拼成和原来 det 一样的格式：[x1,y1,x2,y2,conf,cls]
-                    det = torch.cat(
-                        (
-                            boxes.xyxy,                   # (N,4)
-                            boxes.conf.view(-1, 1),       # (N,1)
-                            boxes.cls.view(-1, 1),        # (N,1)
-                        ),
-                        dim=1,
-                    )
-                    dets = [det]
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            det = self.run_yolo(frame)
+            if det is None or len(det) == 0:
+                return
 
-            for det in dets:
-                if det is None or len(det) == 0:
-                    self.get_logger().info(f"无检测结果")
-                    continue  # 无检测结果，跳过
+            valve_target = self.select_target(det, class_id=0, frame=frame)
+            small_target = self.select_target(det, class_id=1, frame=frame)
 
-                
-                img_center_x = frame.shape[1] / 2
-                img_center_y = frame.shape[0] / 2
-                famen_det = det[det[:, 5] == 0]
-                small_det = det[det[:, 5] == 1]
+            command = self.decide_command(frame, valve_target, small_target)
+            if command is not None and command.valid:
+                self.command_pub.publish(command)
 
-                
-
-                xyz, f_cls, x1, x2, y1, y2 = None, None, None, None, None, None
-                xyz_small, s_cls = None, None
-
-                if len(famen_det) > 0:
-                    max_conf_idx_famen = torch.argmax(famen_det[:, 4]).item()
-                    
-                    xyz, f_cls, x1, x2, y1, y2 = self.get_xyz(famen_det, max_conf_idx_famen, frame)
-                else:
-                    self.get_logger().info(f"未检测到阀门主体")
-
-                if len(small_det) > 0:
-                    max_conf_idx_small = torch.argmax(small_det[:, 4]).item()
-                    xyz_small, s_cls = self.get_xyz(small_det, max_conf_idx_small, frame)
-                else:
-                    self.get_logger().info(f"未检测到小目标")
-                #这里的xyz和xyz_small的格式是[x,y,z]的列表
-                msg = valvecoord()
-                msg.header.stamp = self.get_clock().now().to_msg()
-                msg.header.frame_id = "camera_color_optical_frame"
-
-                if xyz is not None:
-                    msg.x = float(xyz[0])
-                    msg.y = float(xyz[1])
-                    msg.z = float(xyz[2])
-                    msg.valid = True
-                    msg.is_small = False
-                    self.valve_pub.publish(msg)
-
-                if xyz_small is not None:
-                    msg = valvecoord()
-                    msg.header.stamp = self.get_clock().now().to_msg()
-                    msg.header.frame_id = "camera_color_optical_frame"
-                    msg.x = float(xyz_small[0])
-                    msg.y = float(xyz_small[1])
-                    msg.z = float(xyz_small[2])
-                    msg.valid = True
-                    msg.is_small = True
-                    self.valve_pub.publish(msg)
-                    
-            try:
-                cv2.imshow("YOLOv11 Detection", frame)
-                # 等待1ms按键输入（不阻塞主线程）
+            if self.get_parameter('show_image').value:
+                cv2.imshow('YOLOv11 Detection', frame)
                 cv2.waitKey(1)
-                
-            except Exception as e:
-                self.get_logger().error(f"显示失败: {e}")
-        except Exception as e:
-            self.get_logger().error(f"图像处理出错: {e}")
-        
-        
-    def pixel_to_3d(self, u, v, depth_img, cam_info_dict):
-        """
-        根据像素坐标和深度值，计算目标在相机坐标系下的3D坐标
-        原理：针孔相机模型，通过内参将像素坐标反投影到3D空间
-        参数：
-            u, v: 目标像素坐标（图像平面）
-            depth_img: 深度图像（OpenCV格式，值为深度，单位毫米）
-            cam_info_dict: 相机内参字典（包含焦距、主点等）
-        返回：
-            3D坐标 tuple (X, Y, Z)（单位：米），若无效则返回None
-        """
-        # 从内参字典中提取焦距(fx, fy)和主点坐标(cx, cy)
-        fx = cam_info_dict['camera_matrix']['data'][0]  # 焦距x
-        fy = cam_info_dict['camera_matrix']['data'][4]  # 焦距y
-        cx = cam_info_dict['camera_matrix']['data'][2]  # 主点x
-        cy = cam_info_dict['camera_matrix']['data'][5]  # 主点y
 
-        # 检查像素坐标是否在图像范围内（防止越界）
+        except Exception as e:
+            self.get_logger().error(f'图像处理出错: {e}')
+
+    def judge_proper(self, roi):
+        """
+        判断目标（如阀门）是否对正：通过dev_angle模块计算角度偏差
+        参数：
+            roi: 目标区域图像（ROI，OpenCV格式）
+        返回：
+            (is_proper, offset_deg): 元组，is_proper为是否对正（布尔值），offset_deg为角度偏差（度）
+        """
+        try:
+            # 生成目标掩码（如阀门区域掩码）
+            mask = dev_angle.valve_mask(roi)
+            # 计算目标主方向角度（如阀门十字的角度）
+            angle_deg, center = dev_angle.dominant_cross_angle(mask)
+            # 计算与正方向的偏差角度
+            offset_deg = float(dev_angle.angle_offset_from_upright(angle_deg))
+            # 偏差小于10度视为对正
+            return (abs(offset_deg) < 10.0), offset_deg
+        except Exception as e:
+            self.logwarn(f"judge_proper 计算失败: {e}")  # 打印警告
+            return False, 0.0  # 异常时返回默认值        
+
+    def run_yolo(self, frame):
+        results = self.model(frame, imgsz=self.img_size, conf=0.65, iou=0.45, verbose=False)
+        if not results:
+            return torch.empty((0, 6))
+
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return torch.empty((0, 6))
+
+        return torch.cat((boxes.xyxy, boxes.conf.view(-1, 1), boxes.cls.view(-1, 1)), dim=1)
+
+    def select_target(self, det, class_id, frame):
+        class_det = det[det[:, 5] == class_id]
+        if len(class_det) == 0:
+            return None
+
+        idx = torch.argmax(class_det[:, 4]).item()
+        x1, y1, x2, y2, conf, cls = class_det[idx].tolist()
+        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+        cls = int(cls)
+
+        label = f'{self.names[cls]} {conf:.2f}'
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        u = (x1 + x2) / 2.0
+        v = (y1 + y2) / 2.0
+        xyz = self.pixel_to_3d(u, v, self.depth_image, self.camera_info)
+        if xyz is None:
+            return None
+
+        return {
+            'xyz': xyz,              # camera coordinate, meter: X right, Y down, Z forward
+            'bbox': (x1, y1, x2, y2),
+            'confidence': float(conf),
+            'class_id': cls,
+            'is_small': cls == 1,
+        }
+
+    def decide_command(self, frame, valve_target, small_target):
+        """
+        这里集中放“识别判断运动部分”。
+        输出的是给机械臂节点看的高层运动指令，而不是直接 Move.LOffset。
+        """
+        if valve_target is not None:
+            xyz = valve_target['xyz']
+            x_mm = 1000.0 * xyz[0]
+            y_mm = 1000.0 * xyz[2]      # 机器人前后方向，沿用你原来 ly=Z_mm 的逻辑
+            z_mm = -1000.0 * xyz[1]     # 机器人上下方向，沿用你原来 lz=-Y 的逻辑
+            z_depth_mm = 1000.0 * xyz[2]
+
+            if z_depth_mm > 260:
+                if abs(z_depth_mm) >= 400.0:
+                    return self.build_command(
+                        x=x_mm,
+                        y=z_depth_mm - 350.0,
+                        z=z_mm,
+                        is_small=False,
+                        motion_type='far_move',
+                        need_rotation=False,
+                        rotation_deg=0.0,
+                        target=valve_target,
+                    )
+
+                if abs(x_mm) > 5.0 or abs(y_mm) > 5.0:
+                    return self.build_command(
+                        x=x_mm,
+                        y=0.0,
+                        z=z_mm,
+                        is_small=False,
+                        motion_type='no_ahead_check',
+                        need_rotation=False,
+                        rotation_deg=0.0,
+                        target=valve_target,
+                    )
+
+                is_proper, offset_deg = self.estimate_rotation(frame, valve_target['bbox'])
+                return self.build_command(
+                    x=x_mm,
+                    y=z_depth_mm - 250.0,
+                    z=z_mm,
+                    is_small=False,
+                    motion_type='check_and_spin',
+                    need_rotation=not is_proper,
+                    rotation_deg=float(offset_deg),
+                    target=valve_target,
+                )
+
+        if small_target is not None:
+            xyz = small_target['xyz']
+            x_mm = 1000.0 * xyz[0]
+            y_mm = 1000.0 * xyz[2]
+            z_mm = -1000.0 * xyz[1]
+            z_depth_mm = 1000.0 * xyz[2]
+
+            if z_depth_mm < 260:
+                # 注意：这里建议用 abs，否则负方向偏差也会误判为满足条件
+                if abs(x_mm) < 2.0 and abs(y_mm) < 2.0:
+                    motion_type = 'small_move'
+                    y_cmd = z_depth_mm
+                else:
+                    motion_type = 'small_no_head'
+                    y_cmd = 0.0
+
+                return self.build_command(
+                    x=x_mm,
+                    y=y_cmd,
+                    z=z_mm,
+                    is_small=True,
+                    motion_type=motion_type,
+                    need_rotation=False,
+                    rotation_deg=0.0,
+                    target=small_target,
+                )
+
+        return None
+
+    def estimate_rotation(self, frame, bbox):
+        x1, y1, x2, y2 = bbox
+        h, w = frame.shape[:2]
+        x1c, x2c = sorted((max(0, x1), min(w, x2)))
+        y1c, y2c = sorted((max(0, y1), min(h, y2)))
+
+        if x2c - x1c <= 1 or y2c - y1c <= 1:
+            return True, 0.0
+
+        roi = frame[y1c:y2c, x1c:x2c]
+        return judge_proper(roi)
+
+    def build_command(self, x, y, z, is_small, motion_type, need_rotation, rotation_deg, target):
+        msg = ValveCommand()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'camera_color_optical_frame'
+
+        msg.x = float(x)
+        msg.y = float(y)
+        msg.z = float(z)
+        msg.valid = True
+        msg.is_small = bool(is_small)
+        msg.motion_type = motion_type
+        msg.need_rotation_correction = bool(need_rotation)
+        msg.rotation_correction_deg = float(rotation_deg)
+        msg.confidence = float(target['confidence'])
+        msg.class_id = int(target['class_id'])
+        return msg
+
+    def pixel_to_3d(self, u, v, depth_img, cam_info_dict):
+        fx = cam_info_dict['camera_matrix']['data'][0]
+        fy = cam_info_dict['camera_matrix']['data'][4]
+        cx = cam_info_dict['camera_matrix']['data'][2]
+        cy = cam_info_dict['camera_matrix']['data'][5]
+
         if v >= depth_img.shape[0] or u >= depth_img.shape[1] or v < 0 or u < 0:
             return None
 
-        # 获取深度值（单位：毫米），若为0则表示深度无效
         d = depth_img[int(v), int(u)]
         if d == 0:
-            return None  # 深度无效，返回None
-        d = d / 1000.0  # 转换为米
+            return None
 
-        # 计算相机坐标系下的3D坐标（右手坐标系：X右，Y下，Z前）
-        X = (u - cx) * d / fx  # X坐标
-        Y = (v - cy) * d / fy  # Y坐标
-        Z = d                  # Z坐标（深度）
-        return (X, Y, Z)
-    
+        d = float(d) / 1000.0
+        x = (u - cx) * d / fx
+        y = (v - cy) * d / fy
+        z = d
+        return x, y, z
+
     def load_camera_info(self, yaml_file):
-        """
-        从YAML文件加载相机内参（焦距、主点等）
-        参数：
-            yaml_file: 相机内参YAML文件路径
-        返回：
-            包含相机内参的字典（如camera_matrix、distortion_coefficients等）
-        """
-        with open(yaml_file, 'r') as file:
-            cam_info = yaml.safe_load(file)  # 安全加载YAML内容
-        self.get_logger().info(f"加载的相机内参: {cam_info}")  # 打印内参信息（调试用）
-        self.camera_info = cam_info  
+        with open(yaml_file, 'r') as f:
+            cam_info = yaml.safe_load(f)
+        self.get_logger().info(f'Loaded camera info from: {yaml_file}')
+        return cam_info
 
-    def get_xyz(self, det, max_conf_idx, frame):
-        x1, y1, x2, y2, conf, cls = det[max_conf_idx].tolist()
-        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))  # 转换为整数坐标
-        cls = int(cls)  # 类别索引
-
-        # 在图像上绘制检测框和标签（可视化）
-        label = f'{self.names[cls]} {conf:.2f}'  # 标签：类别+置信度
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)  # 绿色框
-        cv2.putText(frame, label, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)  # 标签文本
-
-        # 计算目标中心点像素坐标
-        x_center = (x1 + x2) / 2.0
-        y_center = (y1 + y2) / 2.0
-
-        # 计算目标在相机坐标系下的3D坐标
-        xyz = self.pixel_to_3d(x_center, y_center, self.depth_image, self.camera_info)
-        if cls==0:
-            return xyz,cls,x1,x2,y1,y2
-        elif cls==1:
-            return xyz,cls    
 
 def main(args=None):
     rclpy.init(args=args)
-    valve_detection_node = ValveDetectionNode('valve_detection_node')
-    valve_detection_node.load_camera_info('/home/jetson/ultralytics_robot/src/robot_valve_control/robot_valve_control/camera_info.yaml')
-    rclpy.spin(valve_detection_node)
-    valve_detection_node.destroy_node()
+    node = ValveDetectionNode()
+    rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
