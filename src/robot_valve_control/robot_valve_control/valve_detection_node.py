@@ -240,7 +240,7 @@ class ValveDetectionNode(Node):
             return True, 0.0
 
         roi = frame[y1c:y2c, x1c:x2c]
-        return judge_proper(roi)
+        return dev_angle.judge_proper(roi)
 
     def build_command(self, x, y, z, is_small, motion_type, need_rotation, rotation_deg, target):
         msg = ValveCommand()
